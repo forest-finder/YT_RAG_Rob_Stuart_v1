@@ -1,0 +1,5 @@
+streamlit>=1.28.0
+pydantic-ai
+supabase
+python-dotenv
+openai
