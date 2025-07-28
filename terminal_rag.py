@@ -49,10 +49,10 @@ class TerminalRAGSystem:
         self._initialize_clients()
         
         # Search configuration
-        self.similarity_threshold = 0.5  # Lowered for better results
+        self.similarity_threshold = 0.1  # Lowered for better results - vector similarities are typically 0.2-0.4
         self.max_results = 8
         self.embedding_model = "text-embedding-3-small"
-        self.chat_model = "gpt-3.5-turbo"
+        self.chat_model = "gpt-4o-mini"
         
     def _initialize_clients(self):
         """Initialize OpenAI and Supabase clients."""
@@ -62,7 +62,7 @@ class TerminalRAGSystem:
             raise ValueError("OPENAI_API_KEY environment variable is required")
         
         self.embedding_model_client = OpenAIModel('text-embedding-3-small')
-        self.chat_model_client = OpenAIModel('gpt-3.5-turbo')
+        self.chat_model_client = OpenAIModel('gpt-4o-mini')
         self.chat_agent = Agent(self.chat_model_client)
         
         # Supabase configuration
@@ -91,17 +91,85 @@ class TerminalRAGSystem:
     def keyword_search(self, query: str, limit: int = 5) -> List[Dict]:
         """Search for documents using keyword matching with video metadata."""
         try:
-            # Create a text search query using Supabase's text search
-            # Join with video_metadata to get video information
-            result = self.supabase.table('content_chunks').select(
-                '*, video_metadata(video_url, title, channel_name, channel_handle, view_count, likes, keywords, is_shorts, comments)'
-            ).text_search(
-                'content', 
-                query,
-                type='websearch'
-            ).limit(limit).execute()
+            # Extract meaningful keywords from the query
+            # Remove common words and punctuation that cause tsquery errors
+            import re
+            stop_words = {'what', 'are', 'the', 'is', 'how', 'do', 'does', 'can', 'will', 'would', 'should', 'could', 'a', 'an', 'and', 'or', 'but', 'in', 'on', 'at', 'to', 'for', 'of', 'with', 'by'}
             
-            return result.data
+            # Clean the query and extract keywords
+            cleaned_query = re.sub(r'[^\w\s]', ' ', query.lower())  # Remove punctuation
+            keywords = [word for word in cleaned_query.split() if word not in stop_words and len(word) > 2]
+            
+            if not keywords:
+                # If no keywords, try a simple content search
+                keywords = [query.replace('?', '').replace('!', '').strip()]
+            
+            # Try multiple search strategies
+            all_results = []
+            
+            # Strategy 1: Use the best keyword for text search
+            for keyword in keywords[:3]:  # Try up to 3 best keywords
+                try:
+                    # First get matching content chunks
+                    content_result = self.supabase.table('content_chunks').select('*').text_search(
+                        'content', 
+                        keyword
+                    ).execute()
+                    
+                    if content_result.data:
+                        # Get unique video_ids from the results
+                        video_ids = list(set([chunk['video_id'] for chunk in content_result.data if chunk.get('video_id')]))
+                        
+                        # Get video metadata for these video_ids
+                        metadata_result = self.supabase.table('video_metadata').select('*').in_('video_id', video_ids).execute()
+                        
+                        # Create a lookup dictionary for video metadata
+                        metadata_lookup = {vm['video_id']: vm for vm in metadata_result.data}
+                        
+                        # Combine the data
+                        for chunk in content_result.data:
+                            video_id = chunk.get('video_id')
+                            if video_id and video_id in metadata_lookup:
+                                # Merge chunk with video metadata
+                                enriched_chunk = {**chunk, **metadata_lookup[video_id]}
+                                all_results.append(enriched_chunk)
+                            else:
+                                all_results.append(chunk)
+                        
+                        break  # Stop after first successful search
+                        
+                except Exception as search_error:
+                    print(f"⚠️ Text search failed for '{keyword}': {str(search_error)}")
+                    continue
+            
+            # Strategy 2: If text search fails, try ilike (case-insensitive pattern matching)
+            if not all_results:
+                try:
+                    for keyword in keywords[:2]:
+                        content_result = self.supabase.table('content_chunks').select('*').ilike(
+                            'content', 
+                            f'%{keyword}%'
+                        ).execute()
+                        
+                        if content_result.data:
+                            all_results.extend(content_result.data)
+                            break
+                            
+                except Exception as ilike_error:
+                    print(f"⚠️ Pattern matching failed: {str(ilike_error)}")
+            
+            # Remove duplicates and limit results
+            seen_ids = set()
+            unique_results = []
+            for result in all_results:
+                result_id = result.get('id')
+                if result_id and result_id not in seen_ids:
+                    seen_ids.add(result_id)
+                    unique_results.append(result)
+                    if len(unique_results) >= limit:
+                        break
+            
+            return unique_results
             
         except Exception as e:
             print(f"❌ Error in keyword search: {str(e)}")
@@ -134,14 +202,24 @@ class TerminalRAGSystem:
             # Generate query embedding
             query_embedding = self.get_embedding(query)
             
-            # Search using the stored function and join with video metadata
-            result = self.supabase.rpc('match_content_chunks_with_metadata', {
-                'query_embedding': query_embedding,
-                'match_threshold': self.similarity_threshold,
-                'match_count': limit
-            }).execute()
-            
-            return result.data
+            # Try the basic function first (we know this works)
+            try:
+                result = self.supabase.rpc('match_content_chunks', {
+                    'query_embedding': query_embedding,
+                    'match_threshold': self.similarity_threshold,
+                    'match_count': limit
+                }).execute()
+                
+                if result.data:
+                    print(f"✅ Vector search found {len(result.data)} results")
+                    return result.data
+                else:
+                    print(f"⚠️ Vector search returned 0 results (threshold: {self.similarity_threshold})")
+                    return []
+                    
+            except Exception as basic_error:
+                print(f"⚠️ Vector search failed: {str(basic_error)}")
+                return []
             
         except Exception as e:
             print(f"❌ Error in vector search: {str(e)}")

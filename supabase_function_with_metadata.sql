@@ -15,7 +15,7 @@ RETURNS TABLE (
   created_at timestamptz,
   updated_at timestamptz,
   similarity float,
-  video_url text,
+  video_url varchar,
   title text,
   channel_name varchar,
   channel_handle varchar,
